@@ -38,6 +38,7 @@ const std::string kServerActiveAsyncCalls = "agent.server_active_async_calls";
 std::vector<c10::Device> getDevicesForTensors(
     const std::vector<torch::Tensor>& tensors,
     const DeviceMap& deviceMap,
+    const std::vector<std::tuple<torch::Tensor, torch::Device>>& devMap,
     const std::string& remoteName) {
   // If the deviceMap is overridden, use that instead.
   const auto errStr = c10::str(
@@ -746,6 +747,7 @@ void TensorPipeAgent::respond(std::shared_ptr<tensorpipe::Pipe>& pipe) {
 c10::intrusive_ptr<JitFuture> TensorPipeAgent::send(
     const WorkerInfo& toWorkerInfo,
     c10::intrusive_ptr<Message> requestMessage,
+    const std::vector<std::tuple<torch::Tensor, torch::Device>>& devMap,
     const float rpcTimeoutSeconds,
     const DeviceMap& deviceMap) {
   TORCH_CHECK(
@@ -803,6 +805,7 @@ c10::intrusive_ptr<JitFuture> TensorPipeAgent::send(
     devices = getDevicesForTensors(
         requestMessage->tensors(),
         deviceMap,
+        devMap,
         clientPipe.pipe_->getRemoteName());
   }
 
