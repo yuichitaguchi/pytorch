@@ -244,9 +244,7 @@ static void nll_loss_out_frame(
                                         std::end(loss_partial_sums),
                                         scalar_t{0});
 
-  if (reduction == Reduction::Mean &&
-      (total_weight_val != 0 || input.numel() == 0)) {
-    // allow NaN result for total_weight_val == 0 case, see #15870
+  if (reduction == Reduction::Mean) {
     output_val /= total_weight_val;
   }
 
@@ -301,125 +299,75 @@ static void nll_loss_backward_out_frame(
   const auto n_dims = input.dim();
   const auto n_classes = input.size(-1);
 
-  auto target_ = target;
-  if (target.dim() == 0) {
-    target_ = target.unsqueeze(0);
-  }
-  auto target_acc = target_.accessor<target_t, 1>();
-
-  auto weight_contiguous = optional_contiguous(weight);
-  const scalar_t* weight_data = optional_data<scalar_t>(weight_contiguous);
-
-  if (reduction == Reduction::None && n_dims == 2) {
-    const auto batch_size = input.size(0);
-    auto grad_input_acc = grad_input.accessor<scalar_t, 2>();
-    auto grad_output_acc = grad_output.accessor<scalar_t, 1>();
-    at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
-      for (auto i = start; i < end; i++) {
-        auto cur_target = target_acc[i];
-        if (cur_target == ignore_index) {
-          continue;
-        }
-        const scalar_t w =
-            weight_data ? weight_data[cur_target] : static_cast<scalar_t>(1);
-        grad_input_acc[i][cur_target] = -w * grad_output_acc[i];
-      }
-    });
-    return;
-  }
-
-  const scalar_t total_weight_value = *total_weight.data_ptr<scalar_t>();
-  if (total_weight_value <= 0) {
-    return;
-  }
-
-  const scalar_t grad_output_value = *grad_output.data_ptr<scalar_t>();
-
-  if (input.dim() == 1) {
-    auto grad_input_acc = grad_input.accessor<scalar_t, 1>();
-
-    const auto cur_target = target_acc[0];
-    if (cur_target != ignore_index) {
-      TORCH_CHECK_INDEX(
-          cur_target >= 0 && cur_target < n_classes,
-          "Target ",
-          cur_target,
-          " is out of bounds.");
-
-      grad_input_acc[cur_target] =
-          (reduction != Reduction::Mean && weight_data != nullptr)
-          ? -weight_data[cur_target]
-          : static_cast<scalar_t>(-1);
-      grad_input_acc[cur_target] *= grad_output_value;
-    }
-  } else if (input.dim() == 2) {
-    auto grad_input_acc = grad_input.accessor<scalar_t, 2>();
-
-    const auto batch_size = input.size(0);
-
-    for (int64_t i = 0; i < batch_size; i++) {
-      const auto cur_target = target_acc[i];
-
-      if (cur_target != ignore_index) {
-        TORCH_CHECK_INDEX(
-            cur_target >= 0 && cur_target < n_classes,
-            "Target ",
-            cur_target,
-            " is out of bounds.");
-
-        const scalar_t w = weight_data != nullptr ? weight_data[cur_target]
-                                                  : static_cast<scalar_t>(1);
-        grad_input_acc[i][cur_target] = -w * grad_output_value;
-
-        if (reduction == Reduction::Mean) {
-          grad_input_acc[i][cur_target] /= total_weight_value;
-        }
-      }
-    }
-  }
-}
-
-void nll_loss_backward_out_cpu_template(
-    const Tensor& grad_input,
-    const Tensor& grad_output,
-    const Tensor& input,
-    const Tensor& target,
-    const Tensor& weight,
-    int64_t reduction,
-    int64_t ignore_index,
-    const Tensor& total_weight) {
+  // grad_input will be sparse in general
   grad_input.zero_();
 
-  AT_DISPATCH_FLOATING_TYPES_AND(
-      ScalarType::BFloat16,
-      input.scalar_type(),
-      "nll_loss_backward_out_frame",
-      [&] {
-        if (target.scalar_type() == kByte) {
-          nll_loss_backward_out_frame<scalar_t, uint8_t>(
-              grad_input,
-              grad_output,
-              input,
-              target,
-              weight,
-              reduction,
-              ignore_index,
-              total_weight);
-        } else {
-          // assumed to be uint64
-          nll_loss_backward_out_frame<scalar_t, int64_t>(
-              grad_input,
-              grad_output,
-              input,
-              target,
-              weight,
-              reduction,
-              ignore_index,
-              total_weight);
+  const auto target_ = target.dim() == 0 ? target.unsqueeze(0) : target;
+  const auto target_acc = target_.accessor<target_t, 1>();
+
+  auto weight_contiguous = optional_contiguous(weight);
+  const scalar_t* const weight_data = optional_data<scalar_t>(weight_contiguous);
+
+  // TODO Implement with TensorIterator for speed
+  if (n_dims == 1) {
+    const scalar_t total_weight_value = *total_weight.data_ptr<scalar_t>();
+    auto grad_input_acc = grad_input.accessor<scalar_t, 1>();
+    const auto cur_target = target_acc[0];
+    if (cur_target != ignore_index) {
+      TORCH_CHECK_INDEX(cur_target >= 0 && cur_target < n_classes,
+          "Target ", cur_target, " is out of bounds.");
+
+      auto grad = -grad_output.template item<scalar_t>();
+      if (reduction != Reduction::Mean && weight_data != nullptr) {
+        grad *= weight_data[cur_target];
+      }
+      grad_input_acc[cur_target] = grad;
+    }
+  } else { // n_dims == 2
+    const auto batch_size = input.size(0);
+    auto grad_input_acc = grad_input.accessor<scalar_t, 2>();
+    if (reduction == Reduction::None) {
+      auto grad_output_acc = grad_output.accessor<scalar_t, 1>();
+      at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
+        for (auto i = start; i < end; i++) {
+          const auto cur_target = target_acc[i];
+          if (cur_target == ignore_index) {
+            continue;
+          }
+          TORCH_CHECK_INDEX(cur_target >= 0 && cur_target < n_classes,
+              "Target ", cur_target, " is out of bounds.");
+          auto grad = -grad_output_acc[i];
+          if (weight_data != nullptr) {
+            grad *= weight_data[cur_target];
+          }
+          grad_input_acc[i][cur_target] = grad;
         }
       });
+    } else {
+      const scalar_t total_weight_value = *total_weight.data_ptr<scalar_t>();
+      const scalar_t grad_output_value = *grad_output.data_ptr<scalar_t>();
+      auto grad_normalized = -grad_output_value;
+      if (reduction == Reduction::Mean) {
+        grad_normalized /= total_weight_value;
+      }
+      at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
+        for (auto i = start; i < end; i++) {
+          const auto cur_target = target_acc[i];
+          if (cur_target == ignore_index) {
+            continue;
+          }
+          TORCH_CHECK_INDEX(cur_target >= 0 && cur_target < n_classes,
+              "Target ", cur_target, " is out of bounds.");
+          auto grad = grad_normalized;
+          if (weight_data != nullptr) {
+            grad *= weight_data[cur_target];
+          }
+          grad_input_acc[i][cur_target] = grad;
+        }
+      });
+    }
+  }
 }
-
 } // namespace
 
 TORCH_IMPL_FUNC(nll_loss_forward_out_cpu)
@@ -445,16 +393,34 @@ TORCH_IMPL_FUNC(nll_loss_backward_out_cpu)
  const Tensor& total_weight,
  const Tensor& grad_input
 ) {
-  const Tensor& weight = weight_opt.getTensorRef();
-  nll_loss_backward_out_cpu_template(
-      grad_input,
-      grad_output,
-      self,
-      target,
-      weight,
-      reduction,
-      ignore_index,
-      total_weight);
+  AT_DISPATCH_FLOATING_TYPES_AND(
+      ScalarType::BFloat16,
+      self.scalar_type(),
+      "nll_loss_backward_out_frame",
+      [&] {
+        if (target.scalar_type() == kByte) {
+          nll_loss_backward_out_frame<scalar_t, uint8_t>(
+              grad_input,
+              grad_output,
+              self,
+              target,
+              weight_opt.getTensorRef(),
+              reduction,
+              ignore_index,
+              total_weight);
+        } else {
+          // assumed to be int64
+          nll_loss_backward_out_frame<scalar_t, int64_t>(
+              grad_input,
+              grad_output,
+              self,
+              target,
+              weight_opt.getTensorRef(),
+              reduction,
+              ignore_index,
+              total_weight);
+        }
+      });
 }
 
 Tensor cross_entropy_loss_prob_target(
