@@ -163,8 +163,9 @@ class TORCH_API RpcAgent {
   virtual c10::intrusive_ptr<JitFuture> send(
       const WorkerInfo& to,
       c10::intrusive_ptr<Message> message,
-      const float rpcTimeoutSeconds = kUnsetRpcTimeout,
-      const DeviceMap& deviceMap = {}) = 0;
+      const TensorToDeviceMap& tensorToDevice = TensorToDeviceMap(),
+      const DeviceMap& deviceMap = {},
+      const float rpcTimeoutSeconds = kUnsetRpcTimeout) = 0;
 
   // Retries sending the message up to maxRetries times until an ACK is
   // receieved. The duration between consecutive sends is increased over
