@@ -3,6 +3,7 @@
 #include <ATen/core/interned_strings.h>
 #include <ATen/core/ivalue.h>
 #include <c10/core/CPUAllocator.h>
+#include <c10/util/hash.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/passes/constant_propagation.h>
@@ -349,7 +350,7 @@ class TORCH_API StaticRuntime {
 /// List/Tuple/Dict of Tensors. Complex output types such as List of Lists are
 /// not supported.
 
-class MemoryPlanner {
+class TORCH_API MemoryPlanner {
  public:
   explicit MemoryPlanner(
       StaticRuntime* runtime,
@@ -373,6 +374,11 @@ class MemoryPlanner {
     return reused_tensors_;
   }
 
+  static size_t computeAlignedTensorSize(size_t nbytes);
+  static at::DataPtr allocateBuffer(
+      size_t size,
+      at::DeviceType deviceType = at::kCPU);
+
  private:
   // ivalues created in one run but not managed by MemoryPlanner
   std::vector<IValue*> unmanaged_ivalues_;
@@ -392,9 +398,6 @@ class MemoryPlanner {
   // size_t managed_output_bytes_{0};
   // size_t reused_output_tensors_{0};
   // at::DataPtr output_buffer_; // allocated each time we call Run()
-
-  static size_t compute_aligned_tensor_size(size_t nbytes);
-  static at::DataPtr allocate_buffer(size_t size);
 };
 
 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
@@ -456,5 +459,42 @@ class TORCH_API ProcessedNode {
   std::vector<IValue> outputs_;
 };
 
+//  Map each value to all values that are alive at the same time.
+using LivenessMap = FastMap<const Value*, std::set<const Value*>>;
+
+typedef struct LiveRange {
+  size_t begin;
+  size_t end;
+} LiveRange;
+
+inline std::ostream& operator<<(std::ostream& str, LiveRange lvr) {
+  return str << "[" << lvr.begin << ", " << lvr.end << "]";
+}
+
+inline bool operator==(const LiveRange& lhs, const LiveRange& rhs) {
+  return lhs.begin == rhs.begin && lhs.end == rhs.end;
+}
+
+TORCH_API FastSet<const Value*> GetAlwaysAliveValues(
+    const std::shared_ptr<torch::jit::Graph>& graph,
+    AliasDb& db);
+
+TORCH_API std::pair<LivenessMap, FastMap<const Value*, LiveRange>> GetLiveness(
+    const std::shared_ptr<torch::jit::Graph>& graph,
+    const FastSet<const Value*>& always_alive,
+    AliasDb& db);
+
 } // namespace jit
 } // namespace torch
+
+namespace std {
+template <>
+struct hash<torch::jit::LiveRange> {
+  size_t operator()(torch::jit::LiveRange const& range) const {
+    // shift so that single point ranges don't have hash zero (xor cancels)
+    return std::hash<size_t>()(range.begin) ^
+        (std::hash<size_t>()(range.end) << 1);
+  }
+};
+
+} // namespace std
