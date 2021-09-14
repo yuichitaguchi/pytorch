@@ -79,7 +79,8 @@ def discover_tests(
     return sorted(rc)
 
 
-TESTS = discover_tests(
+TESTS = ["test_testing"]
+TESTS += discover_tests(
     blocklisted_patterns=[
         'ao',
         'bottleneck_test',
