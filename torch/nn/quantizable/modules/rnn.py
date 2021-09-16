@@ -80,7 +80,10 @@ class LSTMCell(torch.nn.Module):
         return h, c
 
     def _get_name(self):
-        return 'QuantizableLSTMCell'
+        if isinstance(self.layers[0].layer_fw.cell.igates, torch.nn.quantized.Linear):  # type: ignore[index, union-attr]
+            return 'QuantizedLSTMCell'
+        else:
+            return 'QuantizableLSTMCell'
 
     @classmethod
     def from_params(cls, wi, wh, bi=None, bh=None):
@@ -317,6 +320,22 @@ class LSTM(torch.nn.Module):
         self._set_weight_bias_variables()
 
     def _set_weight_bias_variables(self):
+        r"""Creates member variables to access the weights similar to the nn.LSTM
+
+        Effectively, calling this method performs
+        ```
+        self.weight_ih_l0 = self.layers[0].layer_fw.cell.igates.weight
+        self.weight_ih_l1 = self.layers[1].layer_fw.cell.igates.weight
+        ...
+        self.weight_hh_l0 = self.layers[0].layer_fw.cell.hgates.weight
+        self.weight_hh_l1 = self.layers[1].layer_fw.cell.hgates.weight
+        ...
+        ```
+        Similarly, the variables for bias, as well as the backwards path is
+        created. Note that `self.weight_ih_l0` is NOT a copy of the tensors,
+        but a reference. However, if the original tensor changes, the refernce
+        will be broken.
+        """
         name_str = r"{var_name}_{var_type}h_l{var_layer}"
         var_names = ['weight'] + ['bias'] if self.bias else []
         for idx, layer in enumerate(self.layers):
@@ -390,7 +409,10 @@ class LSTM(torch.nn.Module):
         return x, (hx_tensor, cx_tensor)
 
     def _get_name(self):
-        return 'QuantizableLSTM'
+        if isinstance(self.layers[0].layer_fw.cell.igates, torch.nn.quantized.Linear):
+            return 'QuantizedLSTM'
+        else:
+            return 'QuantizableLSTM'
 
     @classmethod
     def from_float(cls, other, qconfig=None):
