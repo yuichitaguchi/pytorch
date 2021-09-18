@@ -58,9 +58,12 @@ class NormalizationInfo(NamedTuple):
     new_fn_target: Callable
     arg_replacement_tuples: Optional[ArgReplacementTuplesType]
     custom_mapping_fn: Optional[Callable]
-    kwargs_to_move_to_acc_out_ty: Optional[Optional[List[Tuple[str, str]]]]
+    kwargs_to_move_to_acc_out_ty: Optional[List[
+        Union[
+            Tuple[Any, str, bool],
+            Tuple[str, str]]
+    ]]
     needs_shapes_for_normalization: bool
-
 
 # Dict from (op, target) to NormalizationInfo for that op.
 _normalization_dict: Dict[Tuple[str, Union[str, Callable]], NormalizationInfo] = {}
@@ -74,7 +77,12 @@ def _insert_fun(
     arg_replacement_tuples: List[Tuple],
     new_fn_target: Optional[Callable] = None,
     custom_mapping_fn: Optional[Callable] = None,
-    kwargs_to_move_to_acc_out_ty: Optional[Optional[List[Tuple[str, str]]]] = None,
+    kwargs_to_move_to_acc_out_ty:
+        Optional[List[
+            Union[
+                Tuple[Any, str, bool],
+                Tuple[str, str]]
+        ]] = None,
     needs_shapes_for_normalization=False,
     allow_normalize_from_torch_package=False,
 ):
@@ -157,7 +165,12 @@ def register_acc_op_mapping(
     arg_replacement_tuples: Optional[
         List[Union[Tuple[Union[str, Tuple[str, ...]], str], Tuple[Union[str, Tuple[str, ...]], str, bool]]]
     ] = None,
-    kwargs_to_move_to_acc_out_ty: Optional[List[Tuple[str, str]]] = None,
+    kwargs_to_move_to_acc_out_ty:
+        Optional[List[
+            Union[
+                Tuple[Any, str, bool],
+                Tuple[str, str]]
+        ]] = None,
 ):
     """
     Use this decorator to map a non-acc operator to an acc operator.
@@ -235,15 +248,45 @@ def move_kwargs_to_acc_out_ty(
     # and then remove the kwarg from the new_kwargs since it's passed in via
     # acc_out_ty instead.
     tmd_dict: Dict[str, Any] = {}
-    for (
-        orig_kwarg_name,
-        tmd_field_name,
-    ) in normalization_info.kwargs_to_move_to_acc_out_ty:
-        tmd_dict[tmd_field_name] = new_kwargs[orig_kwarg_name]
-        del new_kwargs[orig_kwarg_name]
+
+    for kwarg_replacement_tuple in normalization_info.kwargs_to_move_to_acc_out_ty:
+        if len(kwarg_replacement_tuple) == 2:
+            orig_kwarg_name, tmd_field_name, is_constant = *kwarg_replacement_tuple, False  # type: ignore[misc]
+        else:
+            assert len(kwarg_replacement_tuple) == 3
+            orig_kwarg_name, tmd_field_name, is_constant = kwarg_replacement_tuple  # type: ignore[misc]
+        if is_constant:
+            # when the arg is constant, the fields will be constant value and tmd_field_name
+            constant_value = orig_kwarg_name
+            tmd_dict[tmd_field_name] = constant_value
+        else:
+            assert isinstance(orig_kwarg_name, str)
+            tmd_dict[tmd_field_name] = new_kwargs[orig_kwarg_name]
+            del new_kwargs[orig_kwarg_name]
+
+    qparams = None
+    # generate the qparams dict
+    if "qscheme" in tmd_dict:
+        qscheme = tmd_dict["qscheme"]
+        del tmd_dict["qscheme"]
+        # Extract quantization related kwargs
+        qscheme_to_fields = {
+            torch.per_tensor_affine: {"scale", "zero_point", "dtype"},
+            torch.per_channel_affine: {"scale", "zero_point", "axis", "dtype"},
+        }
+        qparam_fields = set()
+        if qscheme is not None:
+            qparams = {}
+            qparams["qscheme"] = qscheme
+            qparam_fields = qscheme_to_fields[qscheme] if qscheme is not None else set()
+        for tmd_field_name in set(tmd_dict.keys()):
+            if tmd_field_name in qparam_fields:
+                qparams[tmd_field_name] = tmd_dict[tmd_field_name]
+                del tmd_dict[tmd_field_name]
+    tmd_dict["qparams"] = qparams
     # Note: allow_partial_spec here because we are only using the tensor metadata tuple
     # here to pass specific values into the function. For example, for quantization we
-    # only need to provide dtype/q_scale/q_zero_point, but is_quantized and qscheme are
+    # only need to provide qparams dictionary, but is_quantized is
     # not passed in.
     new_kwargs["acc_out_ty"] = acc_utils.build_raw_tensor_meta(**tmd_dict)
 
