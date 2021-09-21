@@ -286,6 +286,17 @@ void BytecodeDeserializer::parseFunctionSchema(
         false /*is_varargs*/,
         false /*is_varret*/);
     function->setSchema(std::move(schema));
+
+    auto isInterface = optional_field(
+                           schemaTableElements,
+                           "is_interface",
+                           BYTECODE_INDEX_SCHEMA_IS_INTERFACE);
+    if (isInterface && isInterface->toBool()) {
+      auto qn = c10::QualifiedName(function_name);
+      if (auto cls = compilation_unit_->get_class(qn.prefix())) {
+        cls->addMethod(&function->getBytecodeFunction());
+      }
+    }
   }
 }
 
