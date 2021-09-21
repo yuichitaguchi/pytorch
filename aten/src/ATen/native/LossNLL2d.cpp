@@ -4,6 +4,7 @@
 #include <ATen/Parallel.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/native/cpu/utils.h>
+#include <c10/macros/Macros.h>
 
 namespace at {
 namespace native {
@@ -88,7 +89,7 @@ static void nll_loss2d_forward_out_frame(
     const Tensor& target,
     const Tensor& weight,
     int64_t reduction,
-    int64_t ignore_index) {
+    int64_t ignore_index) __ubsan_ignore_float_divide_by_zero__ {
   const int64_t n_classes = input.size(1);
 
   scalar_t* total_weight_data = total_weight.data_ptr<scalar_t>();
@@ -212,8 +213,7 @@ static void nll_loss2d_forward_out_frame(
                                         std::end(loss_partial_sums),
                                         scalar_t{0});
 
-  if (reduction == Reduction::Mean &&
-      (total_weight_val != 0 || input.numel() == 0)) {
+  if (reduction == Reduction::Mean) {
     // allow NaN result for total_weight_val == 0 case, see #15870
     output_val /= total_weight_val;
   }
@@ -258,7 +258,7 @@ static void nll_loss2d_backward_out_frame(
     const Tensor& weight,
     int64_t reduction,
     int64_t ignore_index,
-    const Tensor& total_weight) {
+    const Tensor& total_weight) __ubsan_ignore_float_divide_by_zero__ {
   auto weight_contiguous = optional_contiguous(weight);
   const scalar_t* weight_data = optional_data<scalar_t>(weight_contiguous);
 
@@ -295,9 +295,6 @@ static void nll_loss2d_backward_out_frame(
   }
 
   const scalar_t total_weight_value = *total_weight.data_ptr<scalar_t>();
-  if (total_weight_value <= 0) {
-    return;
-  }
 
   TORCH_CHECK(
       grad_output.dim() <= 1 && grad_output.numel() == 1,

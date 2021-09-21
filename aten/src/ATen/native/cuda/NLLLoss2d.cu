@@ -72,8 +72,6 @@ __global__ void nll_loss2d_forward_kernel(
   scalar_t* input,
   int64_t* target,
   scalar_t* weight,
-  bool size_average,
-  int batch_size,
   int n_classes,
   int map_nelem,
   int blocks_per_sample,
@@ -114,16 +112,9 @@ template <typename scalar_t>
 C10_LAUNCH_BOUNDS_1(CUDA_NUM_THREADS)
 __global__ void nll_loss2d_forward_size_average_kernel(
   scalar_t* output,
-  scalar_t* total_weight,
-  int n_elements
-) {
-  if (n_elements == 0) {
-    // Mean reduction on empty tensors produces NaN
-    *output = std::numeric_limits<double>::quiet_NaN();
-  }
-  if (*total_weight != 0) {
-    *output /= *total_weight;
-  }
+  scalar_t* total_weight
+) __ubsan_ignore_float_divide_by_zero__ {
+  *output /= *total_weight;
 }
 
 template <typename scalar_t>
@@ -168,11 +159,7 @@ __global__ void nll_loss2d_backward_kernel(
   int map_nelem,
   int blocks_per_sample,
   int64_t ignore_index
-) {
-  if (*total_weight <= 0) {
-    return;
-  }
-
+) __ubsan_ignore_float_divide_by_zero__ {
   scalar_t norm = size_average ? (static_cast<scalar_t>(1) / *total_weight) : static_cast<scalar_t>(1);
 
   int sample = blockIdx.x / blocks_per_sample;
@@ -281,8 +268,8 @@ void nll_loss2d_forward_out_cuda_template(
   auto weight_ = optional_contiguous(weight);
   auto target_ = target.contiguous();
 
-  output.fill_(0);
-  total_weight.fill_(0);
+  output.zero_();
+  total_weight.zero_();
 
   auto batch_size = target.size(0);
   auto target_numel = target.numel();
@@ -311,8 +298,6 @@ void nll_loss2d_forward_out_cuda_template(
                   input_.data_ptr<scalar_t>(),
                   target_.data_ptr<int64_t>(),
                   optional_data<scalar_t>(weight_),
-                  reduction == at::Reduction::Mean,
-                  input_.size(0),
                   input_.size(1),
                   input_.size(2) * input_.size(3),
                   blocks_per_sample,
@@ -330,8 +315,7 @@ void nll_loss2d_forward_out_cuda_template(
           nll_loss2d_forward_size_average_kernel<scalar_t>
               <<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
                   output.data_ptr<scalar_t>(),
-                  total_weight.data_ptr<scalar_t>(),
-                  input_.numel());
+                  total_weight.data_ptr<scalar_t>());
           C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
