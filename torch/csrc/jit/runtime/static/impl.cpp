@@ -129,6 +129,7 @@ bool mayContainAlias(
   }
   return db.mayContainAlias(as, bs);
 }
+} // namespace
 
 // Get set of all inputs/outputs/constants (always alive) and their aliases
 FastSet<const Value*> GetAlwaysAliveValues(
@@ -166,12 +167,9 @@ FastSet<const Value*> GetAlwaysAliveValues(
   return always_alive;
 }
 
-//  Map each value to all values that are alive at the same time.
-using LivenessMap = FastMap<const Value*, FastSet<const Value*>>;
-
 //  The algorithm does a traversal of the execution graph
 //  while keeping track of the live values.
-LivenessMap GetLivenessMap(
+std::pair<LivenessMap, FastMap<const Value*, LiveRange>> GetLiveness(
     const std::shared_ptr<torch::jit::Graph>& graph,
     const FastSet<const Value*>& always_alive,
     AliasDb& db) {
@@ -181,14 +179,20 @@ LivenessMap GetLivenessMap(
   // map Values to its creation order in graph (Note: only traverse top-level
   // nodes such that nodes under control-flows are represented by top-level
   // block nodes)
+  size_t idx = 0;
   std::vector<const Value*> values_in_creation_order;
   FastMap<const Value*, size_t> values_to_idx_in_creation_order;
+  FastMap<const Node*, size_t> nodes_to_idx_in_topo_order;
   for (const auto* node : graph->nodes()) {
+    nodes_to_idx_in_topo_order[node] = idx++;
     for (const auto* v : node->outputs()) {
       values_to_idx_in_creation_order[v] = values_in_creation_order.size();
       values_in_creation_order.emplace_back(v);
     }
   }
+
+  FastMap<const Value*, size_t> value_creation_topo_idx;
+  FastMap<const Value*, FastSet<size_t>> value_use_topo_idxs;
 
   // presence of a Value in live_values_use_chain means the Value alive
   // Value mapped to set of Nodes that may use the Value (i.e., use-chain of
@@ -221,6 +225,7 @@ LivenessMap GetLivenessMap(
       const auto* node = u.user;
       live_values_use_chain.at(v).insert(node);
       live_nodes_def_chain[node].insert(v);
+      value_use_topo_idxs[v].insert(nodes_to_idx_in_topo_order[node]);
     }
 
     // FIXME(penguin): the following alias refinement seems to assume
@@ -250,7 +255,9 @@ LivenessMap GetLivenessMap(
         // are our own
         live_values_use_chain.at(v).insert(node);
         live_nodes_def_chain[node].insert(v);
+        value_use_topo_idxs[v].insert(nodes_to_idx_in_topo_order[node]);
       }
+      value_creation_topo_idx[aliased_v] = value_creation_topo_idx[v];
     }
   };
 
@@ -270,6 +277,7 @@ LivenessMap GetLivenessMap(
     for (const auto* v : node->outputs()) {
       if (always_alive.count(v) == 0) {
         add_live_value_fn(v);
+        value_creation_topo_idx[v] = nodes_to_idx_in_topo_order[node];
       }
     }
 
@@ -315,8 +323,20 @@ LivenessMap GetLivenessMap(
     }
   }
 
-  return liveness_map;
+  FastMap<const Value*, LiveRange> live_ranges;
+  for (const auto& item : value_use_topo_idxs) {
+    auto value = item.first;
+    auto idxs = item.second;
+
+    live_ranges[value] = {
+        value_creation_topo_idx[value],
+        *std::max_element(begin(idxs), end(idxs))};
+  }
+
+  return std::make_pair(liveness_map, live_ranges);
 }
+
+namespace {
 
 // Collect the set of Values that are candidates for memory planning:
 //   - Values that are used in in-place operators (i.e., _out variants), and
@@ -676,7 +696,7 @@ StaticModule::StaticModule(
   external_values_ = GetAlwaysAliveValues(graph_, alias_db);
 
   if (opts_.optimize_memory) {
-    auto lm = GetLivenessMap(graph_, external_values_, alias_db);
+    auto lm = GetLiveness(graph_, external_values_, alias_db).first;
     auto values = GetMemoryPlanningCandidates(graph_, node_has_out_variant);
     value_to_same_storage_values_ =
         GenerateSameStorageValues(lm, external_values_, values, alias_db);

@@ -3,6 +3,7 @@
 #include <ATen/core/interned_strings.h>
 #include <ATen/core/ivalue.h>
 #include <c10/core/CPUAllocator.h>
+#include <c10/util/hash.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/passes/constant_propagation.h>
@@ -114,7 +115,7 @@ class TORCH_API StaticModule {
  private:
   explicit StaticModule(
       std::pair<std::shared_ptr<torch::jit::Graph>, std::shared_ptr<Module>>
-          graph_and_module,
+      graph_and_module,
       const StaticModuleOptions& opts);
 
   // for <kind, idx>
@@ -387,5 +388,42 @@ class TORCH_API ProcessedNode {
   std::vector<IValue> outputs_;
 };
 
+//  Map each value to all values that are alive at the same time.
+using LivenessMap = FastMap<const Value*, FastSet<const Value*>>;
+
+typedef struct LiveRange {
+  size_t begin;
+  size_t end;
+} LiveRange;
+
+inline std::ostream& operator<<(std::ostream& str, LiveRange lvr) {
+  return str << "[" << lvr.begin << ", " << lvr.end << "]";
+}
+
+inline bool operator==(const LiveRange& lhs, const LiveRange& rhs) {
+  return lhs.begin == rhs.begin && lhs.end == rhs.end;
+}
+
+TORCH_API FastSet<const Value*> GetAlwaysAliveValues(
+    const std::shared_ptr<torch::jit::Graph>& graph,
+    AliasDb& db);
+
+TORCH_API std::pair<LivenessMap, FastMap<const Value*, LiveRange>> GetLiveness(
+    const std::shared_ptr<torch::jit::Graph>& graph,
+    const FastSet<const Value*>& always_alive,
+    AliasDb& db);
+
 } // namespace jit
 } // namespace torch
+
+namespace std {
+template <>
+struct hash<torch::jit::LiveRange> {
+  size_t operator()(torch::jit::LiveRange const& range) const {
+    // shift so that single point ranges don't have hash zero (xor cancels)
+    return std::hash<size_t>()(range.begin) ^
+        (std::hash<size_t>()(range.end) << 1);
+  }
+};
+
+} // namespace std
